@@ -1,0 +1,71 @@
+name: '"Deploy" Action For GitHub Actions'
+description: 'For internal Ion Channel use only. Deploys a service to one of our environments.'
+inputs:
+  aws-account-id:
+    descripton: 'AWS account ID to deploy to'
+    required: true
+  aws-region:
+    descripton: 'AWS region. Default: us-east-1'
+    default: 'us-east-1'
+    required: true
+  environment:
+    description: 'The environment to deploy the service to'
+    required: true
+  service:
+    descripton: 'The service to deploy. This must match the GitHub repo name exactly'
+    required: true
+  branch:
+    description: 'The branch of the repo to deploy'
+    required: true
+  deploy-migrations:
+    description: 'If true, deploys database migrations before deploying the service. Default: true'
+    required: true
+    default: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v2
+      with:
+        repository: 'ion-channel/${{ inputs.service }}'
+        ref: ${{ inputs.branch }}
+
+    - name: Assume Deploy Role in AWS
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/CI-ECS-Deploy
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Log in to AWS ECR
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build Docker Images
+      env:
+        DOCKER_REPO_ACCOUNT: ${{ inputs.aws-account-id }}
+      run: make dockerize
+      shell: bash
+
+    - name: Tag and Push Docker Images
+      env:
+        DOCKER_REPO_ACCOUNT: ${{ inputs.aws-account-id }}
+      run: make deploy_images
+      shell: bash
+
+    - name: Deploy Migrations
+      if: ${{ inputs.deploy-migrations }}
+      run: |
+        cluster=`aws ecs list-clusters --region ${{ inputs.aws-region }} | jq '.clusterArns[] | select(contains("${{ inputs.environment }}"))' -r`; \
+        if [ "$(echo $cluster | wc -w)" -ne 1 ]; then \
+          echo "Missing or too many cluster ids: found '${cluster}'"; \
+          exit 127; \
+        fi; \
+        taskArn=`aws lambda invoke --invocation-type RequestResponse --function-name worker-scheduler_worker-scheduler --cli-binary-format raw-in-base64-out --region ${{ inputs.aws-region }} --log-type Tail --payload '{"service":"${{ inputs.service }}-migrate","image":"${{ inputs.aws-account-id }}.dkr.ecr.${{ inputs.aws-region }}.amazonaws.com/ionchannel/${{ inputs.service }}-migrate:latest","memory":512,"command":["./entrypoint.sh"],"sourceVolume":"HostVol0${{ inputs.service }}","containerPath":"/etc/${{ inputs.service }}","cluster":"${{ inputs.environment }}"}' output.txt | jq -r .LogResult | base64 --decode | grep taskArn | head -n 1 | sed 's/^.*task\///' | cut -d "'" -f 1` && \
+        exitCode=`aws ecs wait tasks-stopped --region ${{ inputs.aws-region }} --cluster $cluster --tasks $taskArn && aws ecs describe-tasks --region ${{ inputs.aws-region }} --cluster $cluster --tasks $taskArn | grep exitCode | cut -d ":" -f 2 | tr -d [:alpha:] | tr -d [:punct:] | tr -d [:space:]` && \
+        if [[ -z "$exitCode" ]] && [[ "$exitCode" == "" ]] || [[ $exitCode == 0 ]]; then echo "Successfully deployed migrations"; else exit $exitCode; fi
+      shell: bash
+
+    - name: Deploy Service
+      env:
+        DEPLOY_ENV: ${{ inputs.environment }}
+      run: make deploy_service
+      shell: bash
