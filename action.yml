@@ -21,6 +21,15 @@ inputs:
     description: 'If true, deploys database migrations before deploying the service. Default: true'
     required: true
     default: true
+  migration-docker-image-name:
+    description: 'The name of the Docker image to use when deploying database migrations. Default: blank string (equivalent to "ionchannel/<service>-migrate")'
+    required: false
+    default: ''
+  migration-docker-cmd:
+    description: 'CMD value used when running the migration Docker image. Default: (JSON array as string) ["./entrypoint.sh"]'
+    required: false
+    default: '["./entrypoint.sh"]'
+
 runs:
   using: 'composite'
   steps:
@@ -53,13 +62,15 @@ runs:
 
     - name: Deploy Migrations
       if: ${{ inputs.deploy-migrations }}
+      env:
+        MIGRATION_DOCKER_IMAGE_NAME: ${{ inputs.migration-docker-image-name }}
       run: |
         cluster=`aws ecs list-clusters --region ${{ inputs.aws-region }} | jq '.clusterArns[] | select(contains("${{ inputs.environment }}"))' -r`; \
         if [ "$(echo $cluster | wc -w)" -ne 1 ]; then \
           echo "Missing or too many cluster ids: found '${cluster}'"; \
           exit 127; \
         fi; \
-        taskArn=`aws lambda invoke --invocation-type RequestResponse --function-name worker-scheduler_worker-scheduler --cli-binary-format raw-in-base64-out --region ${{ inputs.aws-region }} --log-type Tail --payload '{"service":"${{ inputs.service }}-migrate","image":"${{ inputs.aws-account-id }}.dkr.ecr.${{ inputs.aws-region }}.amazonaws.com/ionchannel/${{ inputs.service }}-migrate:latest","memory":512,"command":["./entrypoint.sh"],"sourceVolume":"HostVol0${{ inputs.service }}","containerPath":"/etc/${{ inputs.service }}","cluster":"${{ inputs.environment }}"}' output.txt | jq -r .LogResult | base64 --decode | grep taskArn | head -n 1 | sed 's/^.*task\///' | cut -d "'" -f 1` && \
+        taskArn=`aws lambda invoke --invocation-type RequestResponse --function-name worker-scheduler_worker-scheduler --cli-binary-format raw-in-base64-out --region ${{ inputs.aws-region }} --log-type Tail --payload '{"service":"${{ inputs.service }}-migrate","image":"${{ inputs.aws-account-id }}.dkr.ecr.${{ inputs.aws-region }}.amazonaws.com/'"${MIGRATION_DOCKER_IMAGE_NAME:-"ionchannel/${{ inputs.service }}-migrate"}"':latest","memory":512,"command":${{ inputs.migration-docker-cmd }},"sourceVolume":"HostVol0${{ inputs.service }}","containerPath":"/etc/${{ inputs.service }}","cluster":"${{ inputs.environment }}"}' output.txt | jq -r .LogResult | base64 --decode | grep taskArn | head -n 1 | sed 's/^.*task\///' | cut -d "'" -f 1` && \
         exitCode=`aws ecs wait tasks-stopped --region ${{ inputs.aws-region }} --cluster $cluster --tasks $taskArn && aws ecs describe-tasks --region ${{ inputs.aws-region }} --cluster $cluster --tasks $taskArn | grep exitCode | cut -d ":" -f 2 | tr -d [:alpha:] | tr -d [:punct:] | tr -d [:space:]` && \
         if [[ -z "$exitCode" ]] && [[ "$exitCode" == "" ]] || [[ $exitCode == 0 ]]; then echo "Successfully deployed migrations"; else exit $exitCode; fi
       shell: bash
