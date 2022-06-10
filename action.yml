@@ -61,7 +61,7 @@ runs:
       shell: bash
 
     - name: Deploy Migrations
-      if: ${{ inputs.deploy-migrations }}
+      if: ${{ inputs.deploy-migrations == 'true' }}
       env:
         MIGRATION_DOCKER_IMAGE_NAME: ${{ inputs.migration-docker-image-name }}
       run: |
